@@ -109,7 +109,7 @@ def build_server_config(server: dict, test_path: str) -> dict:
     return server_config
 
 def launch_servers(
-    servers: List[dict], test_default_version: str, test_path: str
+    servers: List[dict], test_default_version: str, test_path: str, server_version: Optional[str] = None
 ) -> List[Any]:
     """
     Launches all server containers required for a test.
@@ -118,13 +118,15 @@ def launch_servers(
         servers (List[dict]): List of server configuration dictionaries.
         test_default_version (str): Default container image version to use if not specified per server.
         test_path (str): Path to use for test-specific substitutions.
+        server_version (Optional[str]): Override for the server container version.
 
     Returns:
         List[Any]: List of tuples containing runner, server, version, and test_path for each launched server.
     """
     runners: List[Any] = []
     for server in servers:
-        version: str = server.get("version", test_default_version)
+        # Priority: --server_version > server["version"] > test_default_version
+        version: str = server_version or server.get("version", test_default_version)
         is_busybox: bool = not server.get("server_config")
         if is_busybox:
             logger.debug(
@@ -174,7 +176,9 @@ def run_single_test(
     test_file: str,
     default_version: str,
     s3_uploader: Optional[S3Uploader],
-    opensearch_logger: Optional[OpenSearchLogger] = None
+    opensearch_logger: Optional[OpenSearchLogger] = None,
+    server_version: Optional[str] = None,
+    test_version: Optional[str] = None
 ) -> None:
     """
     Runs a single test as described in the given test configuration file.
@@ -197,7 +201,7 @@ def run_single_test(
     # Record test start time
     test_start = datetime.datetime.utcnow().isoformat()
 
-    runners = launch_servers(servers, test_default_version, test_path)
+    runners = launch_servers(servers, test_default_version, test_path, server_version=server_version)
     if not runners:
         logger.warning("No runners launched, skipping test.")
         return
@@ -218,8 +222,11 @@ def run_single_test(
     # Use the specified Podman URI to run the test client container
     test_runner = XRootDTestRunner(podman_sock=test_client_uri)
 
-    logger.info(f"Running test client for {server.get('server', 'localhost')} with image {version} on podman URI {test_client_uri}")
-    exit_code, logs = test_runner.run_test(version, test_command, test_volumes, test_env)
+    # Priority: --test_version > test_config["version"] > test_default_version
+    test_client_version = test_version or test_config.get("version", test_default_version)
+
+    logger.info(f"Running test client for {server.get('server', 'localhost')} with image {test_client_version} on podman URI {test_client_uri}")
+    exit_code, logs = test_runner.run_test(test_client_version, test_command, test_volumes, test_env)
 
     print("\n========== Test Logs ==========")
     print(logs)
@@ -236,6 +243,11 @@ def run_single_test(
     test_client_exit_code = exit_code
     test_client_container_name = test_runner.test_container_name
 
+    # Compose test name with folder name
+    folder_name = os.path.basename(os.path.dirname(test_file))
+    original_test_name = test_json.get("name", os.path.basename(test_file))
+    test_name = f"{folder_name}/{original_test_name}"
+
     # Clean up artefact files if specified
     if artefact_paths:
         # Remove artefact files from host-mounted volumes using a cleanup container
@@ -250,12 +262,12 @@ def run_single_test(
     # Export test metadata and log references to OpenSearch, including start/finish
     if opensearch_logger:
         opensearch_logger.export_metadata(
-            version=version,
+            version=test_client_version,
             container_name=test_client_container_name,
             timestamp=timestamp,
             exit_code=test_client_exit_code,
             log_key=test_client_log_key,
-            test_name=test_json.get("name"),
+            test_name=test_name,
             server_logs=server_logs_dict,
             test_client_log=None,
             test_start=test_start,
@@ -266,27 +278,34 @@ def run_tests_from_folder(
     test_dir: str = "tests",
     s3_uploader: Optional[S3Uploader] = None,
     opensearch_logger: Optional[OpenSearchLogger] = None,
-    default_version: Optional[str] = None
+    default_version: Optional[str] = None,
+    server_version: Optional[str] = None,
+    test_version: Optional[str] = None
 ) -> None:
     """
-    Loads all test configurations from a folder and runs each test.
+    Loads all test configurations from a folder (recursively) and runs each test.
 
     Args:
         test_dir (str): Directory containing test configuration files.
         s3_uploader (Optional[S3Uploader]): S3 uploader instance for log upload.
         opensearch_logger (Optional[OpenSearchLogger]): OpenSearch logger instance.
         default_version (Optional[str]): Override for the default container version.
+        server_version (Optional[str]): Override for the server container version.
+        test_version (Optional[str]): Override for the test client container version.
     """
     default_version = default_version or "gridppedi/xrdtesting:xrd-v5.8.3"
-    for test_file in sorted(os.listdir(test_dir)):
-        if not test_file.endswith(".json"):
-            continue
-        run_single_test(
-            os.path.join(test_dir, test_file),
-            default_version,
-            s3_uploader,
-            opensearch_logger
-        )
+    for root, _, files in os.walk(test_dir):
+        for test_file in sorted(files):
+            if not test_file.endswith(".json"):
+                continue
+            run_single_test(
+                os.path.join(root, test_file),
+                default_version,
+                s3_uploader,
+                opensearch_logger,
+                server_version=server_version,
+                test_version=test_version
+            )
 
 def parse_args() -> argparse.Namespace:
     """
@@ -304,15 +323,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--test_config",
         type=str,
-        help="Path to a single test configuration JSON file to run only that test"
+        help="Path to a single test configuration JSON file or directory to run tests"
     )
     parser.add_argument(
         "--container_version",
         type=str,
         default=None,
-        help="Override the default container version for all tests"
+        help="Override the default container version for both servers and test client"
     )
-    # You can add more arguments here as needed
+    parser.add_argument(
+        "--server_version",
+        type=str,
+        default=None,
+        help="Override the container version for all servers"
+    )
+    parser.add_argument(
+        "--test_version",
+        type=str,
+        default=None,
+        help="Override the container version for all test clients"
+    )
     return parser.parse_args()
 
 def main() -> None:
@@ -364,15 +394,37 @@ def main() -> None:
 
     # Use the CLI-provided container version if given, else None
     cli_default_version = args.container_version
+    cli_server_version = args.server_version
+    cli_test_version = args.test_version
 
     if args.test_config:
-        logger.info(f"Running single test from config: {args.test_config}")
-        run_single_test(args.test_config, cli_default_version, s3_uploader, opensearch_logger)
+        if os.path.isdir(args.test_config):
+            logger.info(f"Running all tests in directory: {args.test_config}")
+            run_tests_from_folder(
+                test_dir=args.test_config,
+                s3_uploader=s3_uploader,
+                opensearch_logger=opensearch_logger,
+                default_version=cli_default_version,
+                server_version=cli_server_version,
+                test_version=cli_test_version
+            )
+        else:
+            logger.info(f"Running single test from config: {args.test_config}")
+            run_single_test(
+                args.test_config,
+                cli_default_version,
+                s3_uploader,
+                opensearch_logger,
+                server_version=cli_server_version,
+                test_version=cli_test_version
+            )
     else:
         run_tests_from_folder(
             s3_uploader=s3_uploader,
             opensearch_logger=opensearch_logger,
-            default_version=cli_default_version
+            default_version=cli_default_version,
+            server_version=cli_server_version,
+            test_version=cli_test_version
         )
     logger.info("All tests complete.")
 

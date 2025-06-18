@@ -1,8 +1,8 @@
 {
   "default_version": "gridppedi/xrdtesting:xrd-v5.8.3",
-  "TEST_PATH": "/nfs/XRootD-servers/XRootD-POSIXServer-x509",
+  "TEST_PATH": "/nfs/XRootD-servers/XRootD-POSIXServer-WithRedirector-x509",
   "name": "copy_localFile_remotePOSIX",
-  "description": "Copy a file from a local file system to a remote POSIX server using xrdcp.",
+  "description": "Copy a file from a local file system to a remote POSIX through a redirector using xrdcp.",
   "version": "1.0.0",
 
   "servers": [
@@ -22,13 +22,29 @@
           "TEST_PATH/usr/local/bin": { "bind": "/usr/local/bin", "mode": "ro" },
           "TEST_PATH/etc/xrootd": { "bind": "/etc/xrootd", "mode": "ro" },
           "TEST_PATH/data": { "bind": "/data", "mode": "rw" },
-          "TEST_PATH/entrypoint.sh": { "bind": "/entrypoint.sh", "mode": "ro" }
+          "TEST_PATH/entrypoint-POSIX.sh": { "bind": "/entrypoint.sh", "mode": "ro" }
         }
       }
     },
     {
       "uri": "ssh://root@xrd2.edi.scotgrid.ac.uk:2222/run/podman/podman.sock",
-      "server": "xrd2.edi.scotgrid.ac.uk"
+      "server": "xrd2.edi.scotgrid.ac.uk",
+      "port": 1094,
+
+      "server_config": {
+        "entrypoint": ["/entrypoint.sh"],
+        "volumes": {
+          "/etc/hostname": { "bind": "/etc/hostname", "mode": "ro" },
+          "/etc/vomses": { "bind": "/etc/vomses", "mode": "ro" },
+          "/etc/grid-security": { "bind": "/etc/grid-security", "mode": "ro" },
+          "/tmp": { "bind": "/tmp", "mode": "rw" },
+
+          "TEST_PATH/usr/local/bin": { "bind": "/usr/local/bin", "mode": "ro" },
+          "TEST_PATH/etc/xrootd": { "bind": "/etc/xrootd", "mode": "ro" },
+          "TEST_PATH/data": { "bind": "/data", "mode": "rw" },
+          "TEST_PATH/entrypoint-REDIRECTOR.sh": { "bind": "/entrypoint.sh", "mode": "ro" }
+        }
+      }
     },
     {
       "uri": "ssh://root@xrd3.edi.scotgrid.ac.uk:2222/run/podman/podman.sock",
@@ -40,9 +56,9 @@
     "uri": "ssh://root@xrd1.edi.scotgrid.ac.uk:2222/run/podman/podman.sock",
     "test_command": [
       "/usr/bin/xrdcp",
-      "-d1",
-      "/data/localFile",
-      "root://xrd1.edi.scotgrid.ac.uk:1094//data/testFile2"
+      "-d3",
+      "/data/testFile",
+      "root://xrd2.edi.scotgrid.ac.uk:1094//data/testFile2"
     ],
     "test_volumes": {
       "/etc/hostname": { "bind": "/etc/hostname", "mode": "ro" },

@@ -1,0 +1,26 @@
+version: "3.8"
+services:
+
+  xrootd-posix:
+    image: "gridppedi/xrdtesting:xrd-v5.8.3"
+    container_name: xrootd-posix
+    name: xrootd-posix
+    # Remember we're using the host network mode
+    # This means you need to make sure that the appropriate
+    # ports are externally accessible via the hosts INPUT chain
+    #ports:
+    #  - 1094:1094
+    volumes:
+      - /etc/hostname:/etc/hostname:ro
+      - /etc/grid-security:/etc/grid-security:ro
+      - /etc/vomses:/etc/vomses:ro
+      - ./usr/local/bin:/usr/local/bin:ro
+      - ./etc/xrootd:/etc/xrootd:ro
+      - ./data:/data:rw
+      - ./entrypoint-POSIX-2.sh:/entrypoint.sh:ro
+    entrypoint: /entrypoint.sh
+    # This gives the hostname to be the same inside and outside a container
+    # It also means that XRootD has 'complete' control over it's port binding here
+    # ... just be aware ...
+    network_mode: host
+
