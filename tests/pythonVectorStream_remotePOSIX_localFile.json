@@ -1,0 +1,61 @@
+{
+  "default_version": "gridppedi/xrdtesting:xrd-v5.8.3",
+  "TEST_PATH": "/nfs/XRootD-configs/POSIX-server/noAuthfile/x509",
+  "name": "pythonVectorStream_remotePOSIX_localFile",
+  "description": "Copy a file from a remote POSIX server to a local file system using xrdcp.",
+  "version": "1.0.0",
+
+  "servers": [
+    {
+      "uri": "ssh://root@xrd1.edi.scotgrid.ac.uk:2222/run/podman/podman.sock",
+      "server": "xrd1.edi.scotgrid.ac.uk",
+      "port": 1094,
+
+      "server_config": {
+        "entrypoint": ["/entrypoint.sh"],
+        "volumes": {
+          "/etc/hostname": { "bind": "/etc/hostname", "mode": "ro" },
+          "/etc/vomses": { "bind": "/etc/vomses", "mode": "ro" },
+          "/etc/grid-security": { "bind": "/etc/grid-security", "mode": "ro" },
+          "/tmp": { "bind": "/tmp", "mode": "rw" },
+
+          "TEST_PATH/usr/local/bin": { "bind": "/usr/local/bin", "mode": "ro" },
+          "TEST_PATH/etc/xrootd": { "bind": "/etc/xrootd", "mode": "ro" },
+          "TEST_PATH/data": { "bind": "/data", "mode": "rw" },
+          "TEST_PATH/entrypoint.sh": { "bind": "/entrypoint.sh", "mode": "ro" }
+        }
+      }
+    },
+    {
+      "uri": "ssh://root@xrd2.edi.scotgrid.ac.uk:2222/run/podman/podman.sock",
+      "server": "xrd2.edi.scotgrid.ac.uk"
+    },
+    {
+      "uri": "ssh://root@xrd3.edi.scotgrid.ac.uk:2222/run/podman/podman.sock",
+      "server": "xrd3.edi.scotgrid.ac.uk"
+    }
+  ],
+
+  "test_config": {
+    "test_command": [
+      "/usr/bin/python3",
+      "/scripts/pythonVectorStream.py",
+      "root://xrd1.edi.scotgrid.ac.uk:1094//data/testFile",
+      "/output/testFile"
+    ],
+    "test_volumes": {
+      "/etc/hostname": { "bind": "/etc/hostname", "mode": "ro" },
+      "/etc/vomses": { "bind": "/etc/vomses", "mode": "ro" },
+      "/etc/grid-security": { "bind": "/etc/grid-security", "mode": "ro" },
+      "/tmp": { "bind": "/tmp", "mode": "ro" },
+
+      "TEST_PATH/output": { "bind": "/output", "mode": "rw" },
+      "TEST_PATH/scripts": { "bind": "/scripts", "mode": "ro" }
+    },
+    "artefact_paths": [
+      "/output/testFile"
+    ]
+  }
+
+}
+

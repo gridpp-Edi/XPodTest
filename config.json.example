@@ -1,0 +1,16 @@
+{
+  "s3": {
+    "bucket": "SOME_BUCKET",
+    "access_key": "ACCESS_KEY_USER",
+    "secret_key": "SECRET_SECRET",
+    "endpoint_url": "https://example.com:8000"
+  },
+  "opensearch": {
+    "host": "opensearch-host.example.com",
+    "port": 443,
+    "username": "os-username",
+    "password": "os-password",
+    "use_ssl": true,
+    "index_prefix": "index-prefix"
+  }
+}
