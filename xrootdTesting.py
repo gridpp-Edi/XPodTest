@@ -19,6 +19,7 @@ import datetime
 import json
 import logging
 import os
+import re
 from functools import partial
 from typing import Any, Dict, List, Optional
 
@@ -172,107 +173,137 @@ def cleanup_servers(
         except Exception as e:
             logger.warning(f"Failed to collect/remove server logs: {e}")
 
+def extract_transfer_speed(logs: str) -> float:
+    """
+    Extracts the transfer speed in MB/s from the test client logs.
+    Supports kB/s, MB/s, and GB/s units.
+
+    Args:
+        logs (str): The logs from the test client.
+
+    Returns:
+        float: The transfer speed in MB/s, or None if not found.
+    """
+    match = re.search(r"\[(\d+(?:\.\d+)?)([kMG]B/s)\]", logs)
+    if match:
+        value = float(match.group(1))
+        unit = match.group(2)
+        if unit == "kB/s":
+            return value / 1024
+        elif unit == "MB/s":
+            return value
+        elif unit == "GB/s":
+            return value * 1024
+    return None
+
 def run_single_test(
     test_file: str,
     default_version: str,
     s3_uploader: Optional[S3Uploader],
     opensearch_logger: Optional[OpenSearchLogger] = None,
     server_version: Optional[str] = None,
-    test_version: Optional[str] = None
+    test_version: Optional[str] = None,
+    repeat: int = 1
 ) -> None:
     """
-    Runs a single test as described in the given test configuration file.
+    Runs a single test as described in the given test configuration file, possibly multiple times.
     Records start and finish times and includes them in OpenSearch metadata.
     """
-    logger.info(f"Processing test file: {test_file}")
-    with open(test_file) as f:
-        test_json: dict = json.load(f)
+    for i in range(repeat):
+        logger.info(f"Running test iteration {i+1}/{repeat} for: {test_file}")
+        logger.info(f"Processing test file: {test_file}")
+        with open(test_file) as f:
+            test_json: dict = json.load(f)
 
-    servers: List[dict] = test_json.get("servers", [])
-    if not servers:
-        logger.warning(f"No servers defined in {test_file}, skipping.")
-        return
+        servers: List[dict] = test_json.get("servers", [])
+        if not servers:
+            logger.warning(f"No servers defined in {test_file}, skipping.")
+            return
 
-    # Use the passed default_version (from CLI if provided) instead of the config's default_version
-    test_default_version: str = default_version or test_json.get("default_version", "gridppedi/xrdtesting:xrd-v5.8.3")
-    test_config: dict = test_json.get("test_config", test_json)
-    test_path: str = test_json.get("TEST_PATH", "/tmp")
+        # Use the passed default_version (from CLI if provided) instead of the config's default_version
+        test_default_version: str = default_version or test_json.get("default_version", "gridppedi/xrdtesting:xrd-v5.8.3")
+        test_config: dict = test_json.get("test_config", test_json)
+        test_path: str = test_json.get("TEST_PATH", "/tmp")
 
-    # Record test start time
-    test_start = datetime.datetime.utcnow().isoformat()
+        # Record test start time
+        test_start = datetime.datetime.utcnow().isoformat()
 
-    runners = launch_servers(servers, test_default_version, test_path, server_version=server_version)
-    if not runners:
-        logger.warning("No runners launched, skipping test.")
-        return
+        runners = launch_servers(servers, test_default_version, test_path, server_version=server_version)
+        if not runners:
+            logger.warning("No runners launched, skipping test.")
+            return
 
-    test_command = substitute_path(test_config["test_command"], test_path)
-    test_volumes = substitute_path(test_config["test_volumes"], test_path)
-    artefact_paths = substitute_path(test_config.get("artefact_paths", []), test_path)
-    test_env = test_config.get("test_env", {})
+        test_command = substitute_path(test_config["test_command"], test_path)
+        test_volumes = substitute_path(test_config["test_volumes"], test_path)
+        artefact_paths = substitute_path(test_config.get("artefact_paths", []), test_path)
+        test_env = test_config.get("test_env", {})
 
-    runner, server, version, _ = runners[0]
+        runner, server, version, _ = runners[0]
 
-    # Determine the Podman URI for the test client container
-    test_client_uri = test_config.get("uri", server.get("uri"))
-    if not test_client_uri:
-        logger.warning("No Podman URI specified for test client; using server's URI.")
-        test_client_uri = server.get("uri")
+        # Determine the Podman URI for the test client container
+        test_client_uri = test_config.get("uri", server.get("uri"))
+        if not test_client_uri:
+            logger.warning("No Podman URI specified for test client; using server's URI.")
+            test_client_uri = server.get("uri")
 
-    # Use the specified Podman URI to run the test client container
-    test_runner = XRootDTestRunner(podman_sock=test_client_uri)
+        # Use the specified Podman URI to run the test client container
+        test_runner = XRootDTestRunner(podman_sock=test_client_uri)
 
-    # Priority: --test_version > test_config["version"] > test_default_version
-    test_client_version = test_version or test_config.get("version", test_default_version)
+        # Priority: --test_version > test_config["version"] > test_default_version
+        test_client_version = test_version or test_config.get("version", test_default_version)
 
-    logger.info(f"Running test client for {server.get('server', 'localhost')} with image {test_client_version} on podman URI {test_client_uri}")
-    exit_code, logs = test_runner.run_test(test_client_version, test_command, test_volumes, test_env)
+        logger.info(f"Running test client for {server.get('server', 'localhost')} with image {test_client_version} on podman URI {test_client_uri}")
+        exit_code, logs = test_runner.run_test(test_client_version, test_command, test_volumes, test_env)
 
-    print("\n========== Test Logs ==========")
-    print(logs)
-    print("======== End Test Logs ========\n")
+        print("\n========== Test Logs ==========")
+        print(logs)
+        print("======== End Test Logs ========\n")
 
-    # Record test finish time
-    test_finish = datetime.datetime.utcnow().isoformat()
+        # Extract transfer speed from logs
+        transfer_speed = extract_transfer_speed(logs)
 
-    timestamp: str = test_finish  # Use finish time for log key
-    test_client_log_key = f"logs/{test_runner.test_container_name}-{timestamp}.log"
-    if s3_uploader:
-        s3_uploader.upload_logs(test_client_log_key, logs.encode())
+        # Record test finish time
+        test_finish = datetime.datetime.utcnow().isoformat()
 
-    test_client_exit_code = exit_code
-    test_client_container_name = test_runner.test_container_name
+        timestamp: str = test_finish  # Use finish time for log key
+        test_client_log_key = f"logs/{test_runner.test_container_name}-{timestamp}.log"
+        if s3_uploader:
+            s3_uploader.upload_logs(test_client_log_key, logs.encode())
 
-    # Compose test name with folder name
-    folder_name = os.path.basename(os.path.dirname(test_file))
-    original_test_name = test_json.get("name", os.path.basename(test_file))
-    test_name = f"{folder_name}/{original_test_name}"
+        test_client_exit_code = exit_code
+        test_client_container_name = test_runner.test_container_name
 
-    # Clean up artefact files if specified
-    if artefact_paths:
-        # Remove artefact files from host-mounted volumes using a cleanup container
-        XRootDTestRunner.cleanup_artefacts_with_container(
-            test_volumes, artefact_paths, cleanup_image="busybox", podman_sock=runner.podman_sock
-        )
+        # Compose test name with folder name
+        folder_name = os.path.basename(os.path.dirname(test_file))
+        original_test_name = test_json.get("name", os.path.basename(test_file))
+        test_name = f"{folder_name}/{original_test_name}"
 
-    # Collect and upload server logs, then remove containers
-    server_logs_dict: Dict[str, str] = {}
-    cleanup_servers(runners, timestamp, s3_uploader, server_logs_dict)
+        # Clean up artefact files if specified
+        if artefact_paths:
+            # Remove artefact files from host-mounted volumes using a cleanup container
+            XRootDTestRunner.cleanup_artefacts_with_container(
+                test_volumes, artefact_paths, cleanup_image="busybox", podman_sock=runner.podman_sock
+            )
 
-    # Export test metadata and log references to OpenSearch, including start/finish
-    if opensearch_logger:
-        opensearch_logger.export_metadata(
-            version=test_client_version,
-            container_name=test_client_container_name,
-            timestamp=timestamp,
-            exit_code=test_client_exit_code,
-            log_key=test_client_log_key,
-            test_name=test_name,
-            server_logs=server_logs_dict,
-            test_client_log=None,
-            test_start=test_start,
-            test_finish=test_finish
-        )
+        # Collect and upload server logs, then remove containers
+        server_logs_dict: Dict[str, str] = {}
+        cleanup_servers(runners, timestamp, s3_uploader, server_logs_dict)
+
+        # Export test metadata and log references to OpenSearch, including start/finish
+        if opensearch_logger:
+            opensearch_logger.export_metadata(
+                version=test_client_version,
+                container_name=test_client_container_name,
+                timestamp=timestamp,
+                exit_code=test_client_exit_code,
+                log_key=test_client_log_key,
+                test_name=test_name,
+                server_logs=server_logs_dict,
+                test_client_log=None,
+                test_start=test_start,
+                test_finish=test_finish,
+                transfer_speed=transfer_speed
+            )
 
 def run_tests_from_folder(
     test_dir: str = "tests",
@@ -280,10 +311,11 @@ def run_tests_from_folder(
     opensearch_logger: Optional[OpenSearchLogger] = None,
     default_version: Optional[str] = None,
     server_version: Optional[str] = None,
-    test_version: Optional[str] = None
+    test_version: Optional[str] = None,
+    repeat: int = 1
 ) -> None:
     """
-    Loads all test configurations from a folder (recursively) and runs each test.
+    Loads all test configurations from a folder (recursively) and runs each test, possibly multiple times.
 
     Args:
         test_dir (str): Directory containing test configuration files.
@@ -292,6 +324,7 @@ def run_tests_from_folder(
         default_version (Optional[str]): Override for the default container version.
         server_version (Optional[str]): Override for the server container version.
         test_version (Optional[str]): Override for the test client container version.
+        repeat (int): Number of times to repeat each test.
     """
     default_version = default_version or "gridppedi/xrdtesting:xrd-v5.8.3"
     for root, _, files in os.walk(test_dir):
@@ -304,7 +337,8 @@ def run_tests_from_folder(
                 s3_uploader,
                 opensearch_logger,
                 server_version=server_version,
-                test_version=test_version
+                test_version=test_version,
+                repeat=repeat
             )
 
 def parse_args() -> argparse.Namespace:
@@ -342,6 +376,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Override the container version for all test clients"
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Repeat each test N times (default: 1)"
     )
     return parser.parse_args()
 
@@ -396,6 +436,7 @@ def main() -> None:
     cli_default_version = args.container_version
     cli_server_version = args.server_version
     cli_test_version = args.test_version
+    repeat = args.repeat
 
     if args.test_config:
         if os.path.isdir(args.test_config):
@@ -406,7 +447,8 @@ def main() -> None:
                 opensearch_logger=opensearch_logger,
                 default_version=cli_default_version,
                 server_version=cli_server_version,
-                test_version=cli_test_version
+                test_version=cli_test_version,
+                repeat=repeat
             )
         else:
             logger.info(f"Running single test from config: {args.test_config}")
@@ -416,7 +458,8 @@ def main() -> None:
                 s3_uploader,
                 opensearch_logger,
                 server_version=cli_server_version,
-                test_version=cli_test_version
+                test_version=cli_test_version,
+                repeat=repeat
             )
     else:
         run_tests_from_folder(
@@ -424,7 +467,8 @@ def main() -> None:
             opensearch_logger=opensearch_logger,
             default_version=cli_default_version,
             server_version=cli_server_version,
-            test_version=cli_test_version
+            test_version=cli_test_version,
+            repeat=repeat
         )
     logger.info("All tests complete.")
 
