@@ -16,6 +16,9 @@ These tests are built/tested with the following assumptions in mind:
    This is due to:
     a) Having the same ports used for various servers in a deployment.
     b) Having host-name rDNS explicitly built into several features.
+    (This means in a cloud-env the `/etc/hosts` has been modified to work with XRootD.)
+5. User-Auth'n and proxy credential renewal is handled externally to the running of these tests.
+   (This may change, but for now it's assumed that this is something simply handled by the user.)
 ```
 
 ## Host Requirements
