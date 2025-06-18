@@ -4,6 +4,19 @@ This is the XRootD Integration testing Framework.
 
 As of Q2-2025 this supports bringing up 3 managed servers which have configurations given in the test-suite.
 
+## Assumptions
+
+These tests are built/tested with the following assumptions in mind:
+
+```
+1. XRootD has the uid/gid 1000:1000
+2. All servers involved are setup as 'normal' grid servers with host certs etc.
+3. The Podman socket is rootful allowing containers to run with net=host and use priviledged ports. The latter also preserves the hostname when running in the container.
+4. 1 XRootD service will run per host.
+   This is due to:
+    a) Having the same ports used for various servers in a deployment.
+    b) Having host-name rDNS explicitly built into several features.
+```
 
 ## Host Requirements
 

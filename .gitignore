@@ -202,3 +202,6 @@ __marimo__/
 
 # Config file with local secrets
 config.json
+
+# Ignore any accidentally copied test files
+**/testFile

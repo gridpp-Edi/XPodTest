@@ -1,6 +1,6 @@
 {
   "default_version": "gridppedi/xrdtesting:xrd-v5.8.3",
-  "TEST_PATH": "/nfs/XRootD-configs/POSIX-server/noAuthfile/x509",
+  "TEST_PATH": "/nfs/XRootD-servers/XRootD-POSIXServer-x509",
   "name": "copy_remotePOSIX_localFile",
   "description": "Copy a file from a remote POSIX server to a local file system using xrdcp.",
   "version": "1.0.0",
@@ -37,6 +37,7 @@
   ],
 
   "test_config": {
+    "uri": "ssh://root@xrd1.edi.scotgrid.ac.uk:2222/run/podman/podman.sock",
     "test_command": [
       "/usr/bin/xrdcp",
       "-d1",

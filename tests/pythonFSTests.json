@@ -1,8 +1,8 @@
 {
   "default_version": "gridppedi/xrdtesting:xrd-v5.8.3",
-  "TEST_PATH": "/nfs/XRootD-tests/XRootD-POSIXServer-x509",
-  "name": "pythonStream_remotePOSIX_localFile",
-  "description": "Copy a file from a remote POSIX server to a local file system using xrdcp.",
+  "TEST_PATH": "/nfs/XRootD-servers/XRootD-POSIXServer-x509",
+  "name": "pythonFSTests",
+  "description": "Tests of various Python file system operations.",
   "version": "1.0.0",
 
   "servers": [

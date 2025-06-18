@@ -219,7 +219,7 @@ def run_single_test(
     test_runner = XRootDTestRunner(podman_sock=test_client_uri)
 
     logger.info(f"Running test client for {server.get('server', 'localhost')} with image {version} on podman URI {test_client_uri}")
-    exit_code, logs = test_runner.run_test(version, test_command, test_volumes, test_env, artefact_paths)
+    exit_code, logs = test_runner.run_test(version, test_command, test_volumes, test_env)
 
     print("\n========== Test Logs ==========")
     print(logs)
