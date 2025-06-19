@@ -37,7 +37,7 @@
   ],
 
   "test_config": {
-    "uri": "ssh://root@xrd1.edi.scotgrid.ac.uk:2222/run/podman/podman.sock",
+    "uri": "ssh://root@xrd2.edi.scotgrid.ac.uk:2222/run/podman/podman.sock",
     "test_command": [
       "/usr/bin/xrdcp",
       "-d1",

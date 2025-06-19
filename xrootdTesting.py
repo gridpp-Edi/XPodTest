@@ -20,12 +20,13 @@ import json
 import logging
 import os
 import re
+import time
 from functools import partial
 from typing import Any, Dict, List, Optional
 
+from osupload import OpenSearchLogger, real_opensearch_upload
 from runner import XRootDTestRunner
 from s3upload import S3Uploader, real_s3_upload
-from osupload import OpenSearchLogger, real_opensearch_upload
 
 # Setup logging
 logging.basicConfig(
@@ -128,19 +129,11 @@ def launch_servers(
     for server in servers:
         # Priority: --server_version > server["version"] > test_default_version
         version: str = server_version or server.get("version", test_default_version)
-        is_busybox: bool = not server.get("server_config")
-        if is_busybox:
-            logger.debug(
-                f"Launching dummy busybox server for {server.get('server', 'localhost')} (no image/server_config defined, using busybox 'hello world')"
-            )
-        else:
-            logger.debug(
-                f"Launching server for {server.get('server', 'localhost')} with image {version}"
-            )
         runner = XRootDTestRunner(podman_sock=server["uri"])
         server_config = build_server_config(server, test_path)
-        runner.launch_server(version, server_config)
+        runner.launch_server(version, server_config)  # version here is the CLI override if set
         runners.append((runner, server, version, test_path))
+        logger.info(f"Initialized server container '{runner.server_container_name}' on host '{server.get('server', 'localhost')}' with image '{version}'")
     return runners
 
 def cleanup_servers(
@@ -175,7 +168,7 @@ def cleanup_servers(
 
 def extract_transfer_speed(logs: str) -> float:
     """
-    Extracts the transfer speed in MB/s from the test client logs.
+    Extracts the final transfer speed in MB/s from the test client logs.
     Supports kB/s, MB/s, and GB/s units.
 
     Args:
@@ -184,10 +177,10 @@ def extract_transfer_speed(logs: str) -> float:
     Returns:
         float: The transfer speed in MB/s, or None if not found.
     """
-    match = re.search(r"\[(\d+(?:\.\d+)?)([kMG]B/s)\]", logs)
-    if match:
-        value = float(match.group(1))
-        unit = match.group(2)
+    matches = re.findall(r"\[(\d+(?:\.\d+)?)([kMG]B/s)\]", logs)
+    if matches:
+        value, unit = matches[-1]  # Use the last occurrence
+        value = float(value)
         if unit == "kB/s":
             return value / 1024
         elif unit == "MB/s":
@@ -203,7 +196,8 @@ def run_single_test(
     opensearch_logger: Optional[OpenSearchLogger] = None,
     server_version: Optional[str] = None,
     test_version: Optional[str] = None,
-    repeat: int = 1
+    repeat: int = 1,
+    sleep_after_servers: int = 0  # <-- Add this parameter
 ) -> None:
     """
     Runs a single test as described in the given test configuration file, possibly multiple times.
@@ -233,6 +227,11 @@ def run_single_test(
             logger.warning("No runners launched, skipping test.")
             return
 
+        # Optional sleep after starting servers
+        if sleep_after_servers > 0:
+            logger.info(f"Sleeping for {sleep_after_servers} seconds before running the test...")
+            time.sleep(sleep_after_servers)
+
         test_command = substitute_path(test_config["test_command"], test_path)
         test_volumes = substitute_path(test_config["test_volumes"], test_path)
         artefact_paths = substitute_path(test_config.get("artefact_paths", []), test_path)
@@ -255,12 +254,13 @@ def run_single_test(
         logger.info(f"Running test client for {server.get('server', 'localhost')} with image {test_client_version} on podman URI {test_client_uri}")
         exit_code, logs = test_runner.run_test(test_client_version, test_command, test_volumes, test_env)
 
-        print("\n========== Test Logs ==========")
-        print(logs)
-        print("======== End Test Logs ========\n")
+        logger.debug("\n========== Test Logs ==========")
+        logger.debug(logs)
+        logger.debug("======== End Test Logs ========\n")
 
         # Extract transfer speed from logs
         transfer_speed = extract_transfer_speed(logs)
+        logger.info(f"Extracted transfer speed: {transfer_speed} MB/s" if transfer_speed is not None else "No transfer speed found in logs.")
 
         # Record test finish time
         test_finish = datetime.datetime.utcnow().isoformat()
@@ -312,7 +312,8 @@ def run_tests_from_folder(
     default_version: Optional[str] = None,
     server_version: Optional[str] = None,
     test_version: Optional[str] = None,
-    repeat: int = 1
+    repeat: int = 1,
+    sleep_after_servers: int = 0  # <-- Add this parameter
 ) -> None:
     """
     Loads all test configurations from a folder (recursively) and runs each test, possibly multiple times.
@@ -338,7 +339,8 @@ def run_tests_from_folder(
                 opensearch_logger,
                 server_version=server_version,
                 test_version=test_version,
-                repeat=repeat
+                repeat=repeat,
+                sleep_after_servers=sleep_after_servers
             )
 
 def parse_args() -> argparse.Namespace:
@@ -382,6 +384,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Repeat each test N times (default: 1)"
+    )
+    parser.add_argument(
+        "--sleep_after_servers",
+        type=int,
+        default=0,
+        help="Sleep N seconds after starting servers and before running the test (default: 0)"
     )
     return parser.parse_args()
 
@@ -437,6 +445,7 @@ def main() -> None:
     cli_server_version = args.server_version
     cli_test_version = args.test_version
     repeat = args.repeat
+    sleep_after_servers = args.sleep_after_servers
 
     if args.test_config:
         if os.path.isdir(args.test_config):
@@ -448,7 +457,8 @@ def main() -> None:
                 default_version=cli_default_version,
                 server_version=cli_server_version,
                 test_version=cli_test_version,
-                repeat=repeat
+                repeat=repeat,
+                sleep_after_servers=sleep_after_servers
             )
         else:
             logger.info(f"Running single test from config: {args.test_config}")
@@ -459,7 +469,8 @@ def main() -> None:
                 opensearch_logger,
                 server_version=cli_server_version,
                 test_version=cli_test_version,
-                repeat=repeat
+                repeat=repeat,
+                sleep_after_servers=sleep_after_servers
             )
     else:
         run_tests_from_folder(
@@ -468,7 +479,8 @@ def main() -> None:
             default_version=cli_default_version,
             server_version=cli_server_version,
             test_version=cli_test_version,
-            repeat=repeat
+            repeat=repeat,
+            sleep_after_servers=sleep_after_servers
         )
     logger.info("All tests complete.")
 

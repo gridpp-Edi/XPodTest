@@ -1,12 +1,12 @@
-import re
-import time
-import socket
 import datetime
 import logging
+import re
 import requests
-from typing import Any, Dict, Optional, Tuple, List
+import socket
+import time
 from podman import PodmanClient
-from podman.errors.exceptions import NotFound, APIError
+from podman.errors.exceptions import APIError, NotFound
+from typing import Any, Dict, List, Optional, Tuple
 
 # Ensure logger is defined for this module
 logger = logging.getLogger("xrootdtesting")
@@ -49,9 +49,9 @@ class XRootDTestRunner:
         Returns:
             str: Generated container name.
         """
-        safe_version: str = re.sub(r'[^a-zA-Z0-9_.-]', '_', version)
-        safe_host: str = re.sub(r'[^a-zA-Z0-9_.-]', '_', host)
-        name: str = f"{base}-{safe_version}-{safe_host}"
+        # Use only the tag part of the version for the name, to avoid slashes
+        tag = version.split(":")[-1] if ":" in version else version
+        name: str = f"{base}-{host.replace('.', '-')}-{tag}"
         logger.debug(f"Generated container name: {name}")
         return name
 
@@ -79,6 +79,20 @@ class XRootDTestRunner:
         logger.error(f"Service {host}:{port} did not become ready in time")
         raise RuntimeError("Service did not become ready in time")
 
+    def cleanup_xrootd_containers(self):
+        """
+        Stops and removes all containers with names starting with 'xrootd_' or 'xrootd-'.
+        """
+        with self._get_client() as client:
+            for container in client.containers.list(all=True):
+                # Match both 'xrootd_' and 'xrootd-' prefixes
+                if re.match(r"^xrootd[_-]", container.name):
+                    try:
+                        container.remove(force=True)
+                        logger.debug(f"Removed existing container: {container.name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to remove container {container.name}: {e}")
+
     def launch_server(self, version: str, server_config: Dict[str, Any]) -> None:
         """
         Launches the XRootD server container.
@@ -87,7 +101,10 @@ class XRootDTestRunner:
             version (str): Container image version to use.
             server_config (Dict[str, Any]): Configuration for the server container, including entrypoint, volumes, host, port, and optionally environment variables.
         """
-        self.server_container_name: str = self._generate_name("xrootd-posix", version, server_config['host'])
+        # Clean up any existing xrootd containers before starting a new one
+        self.cleanup_xrootd_containers()
+
+        self.server_container_name: str = self._generate_name("xrootd-server", version, server_config['host'])
         logger.debug(f"Launching server container: {self.server_container_name} with image {version}")
         try:
             with self._get_client() as client:
@@ -249,6 +266,15 @@ class XRootDTestRunner:
 
         try:
             with PodmanClient(base_url=podman_sock) as client:
+                # Remove any existing cleanup-all-artefacts containers before starting a new one
+                for container in client.containers.list(all=True):
+                    if container.name == "cleanup-all-artefacts":
+                        try:
+                            container.remove(force=True)
+                            logger.debug(f"Removed existing artefact cleanup container: {container.name}")
+                        except Exception as e:
+                            logger.warning(f"Failed to remove artefact cleanup container {container.name}: {e}")
+
                 client.containers.run(
                     image=cleanup_image,
                     name="cleanup-all-artefacts",
