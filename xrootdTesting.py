@@ -15,12 +15,14 @@ It includes functionality for:
 """
 
 import argparse
+import concurrent.futures
 import datetime
 import json
 import logging
 import os
 import re
 import time
+import uuid
 from functools import partial
 from typing import Any, Dict, List, Optional
 
@@ -197,12 +199,82 @@ def run_single_test(
     server_version: Optional[str] = None,
     test_version: Optional[str] = None,
     repeat: int = 1,
-    sleep_after_servers: int = 0  # <-- Add this parameter
+    sleep_after_servers: int = 0,
+    extra_env: Optional[Dict[str, str]] = None,
+    container_suffix: str = ""
 ) -> None:
     """
-    Runs a single test as described in the given test configuration file, possibly multiple times.
+    Runs a single test as described in the given test configuration file, possibly multiple times or in parallel.
     Records start and finish times and includes them in OpenSearch metadata.
     """
+    with open(test_file) as f:
+        test_json: dict = json.load(f)
+
+    test_config: dict = test_json.get("test_config", test_json)
+    test_path: str = test_json.get("TEST_PATH", "/tmp")
+    parallel_repeats = test_config.get("parallel_repeats", 0)
+
+    # Only do parallel on outermost call
+    if parallel_repeats and parallel_repeats > 1 and not container_suffix:
+        servers: List[dict] = test_json.get("servers", [])
+        if not servers:
+            logger.warning(f"No servers defined in {test_file}, skipping.")
+            return
+
+        test_default_version: str = default_version or test_json.get("default_version", "gridppedi/xrdtesting:xrd-v5.8.3")
+        # Start servers ONCE
+        logger.info(f"Launching servers for parallel test execution ({parallel_repeats} clients)...")
+        runners = launch_servers(servers, test_default_version, test_path, server_version=server_version)
+        if not runners:
+            logger.warning("No runners launched, skipping test.")
+            return
+
+        # Attach runner info to each server dict for use in client-only runs
+        for idx, (runner, server, version, test_path) in enumerate(runners):
+            servers[idx]["runner_tuple"] = (runner, server, version, test_path)
+
+        if sleep_after_servers > 0:
+            logger.info(f"Sleeping for {sleep_after_servers} seconds before running parallel test clients...")
+            time.sleep(sleep_after_servers)
+
+        logger.info(f"Starting {parallel_repeats} parallel test client runs for {test_file}...")
+        def run_client_instance(suffix):
+            logger.debug(f"Starting parallel test client with suffix {suffix}")
+            return run_test_client_only(
+                test_json,
+                test_config,
+                test_path,
+                default_version,
+                s3_uploader,
+                opensearch_logger,
+                server_version,
+                test_version,
+                0,  # Don't sleep again
+                extra_env,
+                suffix
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_repeats) as executor:
+            futures = [
+                executor.submit(run_client_instance, f"-parallel-{i}-{uuid.uuid4().hex[:8]}")
+                for i in range(parallel_repeats)
+            ]
+            logger.info(f"Submitted all {parallel_repeats} parallel test client jobs.")
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    result = future.result()
+                    logger.debug("A parallel test client finished successfully.")
+                except Exception as e:
+                    logger.error(f"Parallel test run failed: {e}")
+
+        logger.info("All parallel test clients have completed. Cleaning up servers...")
+        # Clean up servers after all clients are done
+        timestamp = datetime.datetime.utcnow().isoformat()
+        server_logs_dict: Dict[str, str] = {}
+        cleanup_servers(runners, timestamp, s3_uploader, server_logs_dict)
+        logger.info("Server cleanup after parallel execution complete.")
+        return  # Do not continue with the sequential logic
+
     for i in range(repeat):
         logger.info(f"Running test iteration {i+1}/{repeat} for: {test_file}")
         logger.info(f"Processing test file: {test_file}")
@@ -237,7 +309,12 @@ def run_single_test(
         artefact_paths = substitute_path(test_config.get("artefact_paths", []), test_path)
         test_env = test_config.get("test_env", {})
 
-        runner, server, version, _ = runners[0]
+        # Handle extra environment variables from CLI
+        test_env = test_config.get("test_env", {})
+        if extra_env:
+            test_env.update(extra_env)
+
+        runner, server, _, _ = runners[0]
 
         # Determine the Podman URI for the test client container
         test_client_uri = test_config.get("uri", server.get("uri"))
@@ -247,12 +324,12 @@ def run_single_test(
 
         # Use the specified Podman URI to run the test client container
         test_runner = XRootDTestRunner(podman_sock=test_client_uri)
-
-        # Priority: --test_version > test_config["version"] > test_default_version
         test_client_version = test_version or test_config.get("version", test_default_version)
 
         logger.info(f"Running test client for {server.get('server', 'localhost')} with image {test_client_version} on podman URI {test_client_uri}")
-        exit_code, logs = test_runner.run_test(test_client_version, test_command, test_volumes, test_env)
+        exit_code, logs = test_runner.run_test(
+            test_client_version, test_command, test_volumes, test_env, container_suffix=container_suffix
+        )
 
         logger.debug("\n========== Test Logs ==========")
         logger.debug(logs)
@@ -305,6 +382,89 @@ def run_single_test(
                 transfer_speed=transfer_speed
             )
 
+def run_test_client_only(
+    test_json: dict,
+    test_config: dict,
+    test_path: str,
+    default_version: str,
+    s3_uploader: Optional[S3Uploader],
+    opensearch_logger: Optional[OpenSearchLogger],
+    server_version: Optional[str],
+    test_version: Optional[str],
+    sleep_after_servers: int,
+    extra_env: Optional[Dict[str, str]],
+    container_suffix: str
+) -> None:
+    servers: List[dict] = test_json.get("servers", [])
+    if not servers or "runner_tuple" not in servers[0]:
+        logger.error("No server runner info found for parallel test client run.")
+        return
+
+    test_default_version: str = default_version or test_json.get("default_version", "gridppedi/xrdtesting:xrd-v5.8.3")
+    test_command = substitute_path(test_config["test_command"], test_path)
+    test_volumes = substitute_path(test_config["test_volumes"], test_path)
+    artefact_paths = substitute_path(test_config.get("artefact_paths", []), test_path)
+    test_env = test_config.get("test_env", {})
+    if extra_env:
+        test_env.update(extra_env)
+
+    runner, server, _, _ = servers[0]["runner_tuple"]
+
+    test_client_uri = test_config.get("uri", server.get("uri"))
+    if not test_client_uri:
+        logger.warning("No Podman URI specified for test client; using server's URI.")
+        test_client_uri = server.get("uri")
+
+    test_runner = XRootDTestRunner(podman_sock=test_client_uri)
+    test_client_version = test_version or test_config.get("version", test_default_version)
+
+    logger.info(f"Running test client for {server.get('server', 'localhost')} with image {test_client_version} on podman URI {test_client_uri}")
+    exit_code, logs = test_runner.run_test(
+        test_client_version, test_command, test_volumes, test_env, container_suffix=container_suffix
+    )
+
+    logger.debug("\n========== Test Logs ==========")
+    logger.debug(logs)
+    logger.debug("======== End Test Logs ========\n")
+
+    transfer_speed = extract_transfer_speed(logs)
+    logger.info(f"Extracted transfer speed: {transfer_speed} MB/s" if transfer_speed is not None else "No transfer speed found in logs.")
+
+    test_finish = datetime.datetime.utcnow().isoformat()
+    timestamp: str = test_finish
+    test_client_log_key = f"logs/{test_runner.test_container_name}-{timestamp}.log"
+    if s3_uploader:
+        s3_uploader.upload_logs(test_client_log_key, logs.encode())
+
+    test_client_exit_code = exit_code
+    test_client_container_name = test_runner.test_container_name
+
+    folder_name = os.path.basename(os.path.dirname(test_json.get('name', '')))
+    original_test_name = test_json.get("name", os.path.basename(test_json.get('name', '')))
+    test_name = f"{folder_name}/{original_test_name}"
+
+    if artefact_paths:
+        XRootDTestRunner.cleanup_artefacts_with_container(
+            test_volumes, artefact_paths, cleanup_image="busybox", podman_sock=runner.podman_sock
+        )
+
+    # No server cleanup here! Only client logic.
+
+    if opensearch_logger:
+        opensearch_logger.export_metadata(
+            version=test_client_version,
+            container_name=test_client_container_name,
+            timestamp=timestamp,
+            exit_code=test_client_exit_code,
+            log_key=test_client_log_key,
+            test_name=test_name,
+            server_logs=None,
+            test_client_log=None,
+            test_start=None,
+            test_finish=test_finish,
+            transfer_speed=transfer_speed
+        )
+
 def run_tests_from_folder(
     test_dir: str = "tests",
     s3_uploader: Optional[S3Uploader] = None,
@@ -313,7 +473,8 @@ def run_tests_from_folder(
     server_version: Optional[str] = None,
     test_version: Optional[str] = None,
     repeat: int = 1,
-    sleep_after_servers: int = 0  # <-- Add this parameter
+    sleep_after_servers: int = 0,
+    extra_env: Optional[Dict[str, str]] = None
 ) -> None:
     """
     Loads all test configurations from a folder (recursively) and runs each test, possibly multiple times.
@@ -340,7 +501,8 @@ def run_tests_from_folder(
                 server_version=server_version,
                 test_version=test_version,
                 repeat=repeat,
-                sleep_after_servers=sleep_after_servers
+                sleep_after_servers=sleep_after_servers,
+                extra_env=extra_env
             )
 
 def parse_args() -> argparse.Namespace:
@@ -391,6 +553,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Sleep N seconds after starting servers and before running the test (default: 0)"
     )
+    parser.add_argument(
+        "--test_env",
+        action="append",
+        default=[],
+        help="Extra environment variables for the test container, e.g. --test_env BEARER_TOKEN=abc123"
+    )
     return parser.parse_args()
 
 def main() -> None:
@@ -408,6 +576,9 @@ def main() -> None:
     )
     logger.setLevel(log_level)
     logger.info("Starting XRootD test runner.")
+
+
+    extra_env = dict(item.split("=", 1) for item in args.test_env)
 
     # Load private config
     private_config = load_private_config()
@@ -458,7 +629,8 @@ def main() -> None:
                 server_version=cli_server_version,
                 test_version=cli_test_version,
                 repeat=repeat,
-                sleep_after_servers=sleep_after_servers
+                sleep_after_servers=sleep_after_servers,
+                extra_env=extra_env
             )
         else:
             logger.info(f"Running single test from config: {args.test_config}")
@@ -470,7 +642,8 @@ def main() -> None:
                 server_version=cli_server_version,
                 test_version=cli_test_version,
                 repeat=repeat,
-                sleep_after_servers=sleep_after_servers
+                sleep_after_servers=sleep_after_servers,
+                extra_env=extra_env
             )
     else:
         run_tests_from_folder(
@@ -480,7 +653,8 @@ def main() -> None:
             server_version=cli_server_version,
             test_version=cli_test_version,
             repeat=repeat,
-            sleep_after_servers=sleep_after_servers
+            sleep_after_servers=sleep_after_servers,
+            extra_env=extra_env
         )
     logger.info("All tests complete.")
 
