@@ -64,8 +64,8 @@ class XRootDTestRunner:
             port (int): Port to connect to.
             timeout (int): Maximum number of seconds to wait.
 
-        Raises:
-            RuntimeError: If the service does not become ready in time.
+            Raises:
+                RuntimeError: If the service does not become ready in time.
         """
         logger.debug(f"Waiting for service {host}:{port} to become ready...")
         for i in range(timeout):
@@ -141,7 +141,8 @@ class XRootDTestRunner:
         version: str,
         test_command: List[str],
         test_volumes: Dict[str, Any],
-        test_env: Dict[str, Any]
+        test_env: Dict[str, Any],
+        container_suffix: str = ""
     ) -> Tuple[int, str]:
         """
         Runs the test client container and collects logs.
@@ -151,11 +152,14 @@ class XRootDTestRunner:
             test_command (List[str]): Command to run in the test client container.
             test_volumes (Dict[str, Any]): Volume mappings for the test client container.
             test_env (Dict[str, Any]): Environment variables for the test client container.
+            container_suffix (str): Optional suffix to append to the container name.
 
         Returns:
             Tuple[int, str]: (exit_code, logs) where exit_code is the container exit code and logs is the combined stdout/stderr output.
         """
         self.test_container_name: str = self._generate_name("xrootd-test-client", version, "test")
+        if container_suffix:
+            self.test_container_name += container_suffix
         self.test_volumes = test_volumes
         logger.debug(f"Running test client container: {self.test_container_name} with image {version}")
         with self._get_client() as client:
@@ -165,10 +169,26 @@ class XRootDTestRunner:
             except NotFound:
                 logger.debug(f"No existing test container to remove: {self.test_container_name}")
 
+            # Prepare volumes and tmpfs
+            volumes = {}
+            mounts = []
+            for host_path, opts in test_volumes.items():
+                bind = opts.get("bind")
+                mode = opts.get("mode", "rw")
+                if mode == "tmpfs":
+                    # Use Podman's mounts API for tmpfs
+                    mounts.append({
+                        "Type": "tmpfs",
+                        "Target": bind
+                    })
+                else:
+                    volumes[host_path] = {"bind": bind, "mode": mode}
+
             test_container = client.containers.run(
                 image=version,
                 name=self.test_container_name,
-                volumes=test_volumes,
+                volumes=volumes,
+                mounts=mounts if mounts else None,
                 environment=test_env,
                 command=test_command,
                 detach=True,
