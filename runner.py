@@ -176,7 +176,6 @@ class XRootDTestRunner:
                 bind = opts.get("bind")
                 mode = opts.get("mode", "rw")
                 if mode == "tmpfs":
-                    # Use Podman's mounts API for tmpfs
                     mounts.append({
                         "Type": "tmpfs",
                         "Target": bind
@@ -184,11 +183,10 @@ class XRootDTestRunner:
                 else:
                     volumes[host_path] = {"bind": bind, "mode": mode}
 
-            test_container = client.containers.run(
+            run_kwargs = dict(
                 image=version,
                 name=self.test_container_name,
                 volumes=volumes,
-                mounts=mounts if mounts else None,
                 environment=test_env,
                 command=test_command,
                 detach=True,
@@ -196,6 +194,11 @@ class XRootDTestRunner:
                 network_mode="host",
                 tty=True,
             )
+
+            if mounts:
+                run_kwargs["mounts"] = mounts
+
+            test_container = client.containers.run(**run_kwargs)
             logger.debug(f"Started test client container: {self.test_container_name}")
 
             test_container.wait()

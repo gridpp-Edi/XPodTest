@@ -170,15 +170,10 @@ def cleanup_servers(
 
 def extract_transfer_speed(logs: str) -> float:
     """
-    Extracts the final transfer speed in MB/s from the test client logs.
-    Supports kB/s, MB/s, and GB/s units.
-
-    Args:
-        logs (str): The logs from the test client.
-
-    Returns:
-        float: The transfer speed in MB/s, or None if not found.
+    Extracts the final transfer speed in MB/s from xrdcp or curl logs.
+    Supports kB/s, MB/s, and GB/s units, and curl's progress output.
     """
+    # Try xrdcp first (existing logic)
     matches = re.findall(r"\[(\d+(?:\.\d+)?)([kMG]B/s)\]", logs)
     if matches:
         value, unit = matches[-1]  # Use the last occurrence
@@ -189,6 +184,27 @@ def extract_transfer_speed(logs: str) -> float:
             return value
         elif unit == "GB/s":
             return value * 1024
+
+    # Try curl: look for the last line starting with 100 (completion line)
+    curl_speed = None
+    for line in logs.splitlines():
+        columns = line.strip().split()
+        if len(columns) >= 12 and columns[0] == "100":
+            # The 7th column (index 6) is the average download speed, e.g. 220M
+            speed_str = columns[6]
+            match = re.match(r"([0-9.]+)([kMG])", speed_str)
+            if match:
+                value, unit = match.groups()
+                value = float(value)
+                if unit == "k":
+                    curl_speed = value / 1024
+                elif unit == "M":
+                    curl_speed = value
+                elif unit == "G":
+                    curl_speed = value * 1024
+    if curl_speed is not None:
+        return curl_speed
+
     return None
 
 def run_single_test(

@@ -36,7 +36,7 @@
   ],
 
   "test_config": {
-    "uri": "ssh://root@xrd2.edi.scotgrid.ac.uk:2222/run/podman/podman.sock",
+    "uri": "ssh://root@xrd1.edi.scotgrid.ac.uk:2222/run/podman/podman.sock",
     "test_command": [
       "curl",
       "--cert", "/tmp/x509up_u1000",
@@ -50,6 +50,7 @@
       "/etc/hostname": { "bind": "/etc/hostname", "mode": "ro" },
       "/etc/vomses": { "bind": "/etc/vomses", "mode": "ro" },
       "/etc/grid-security": { "bind": "/etc/grid-security", "mode": "ro" },
+      "/tmp": { "bind": "/tmp", "mode": "ro" },
 
       "TEST_PATH/output": { "bind": "/output", "mode": "rw" }
     },
