@@ -446,6 +446,15 @@ def _run_test_client_and_collect(
         logger.error("Failed to launch servers after retries.")
         return
 
+    # Collect server container name and image for OpenSearch
+    server_versions = {
+        server.get('server', f'server_{i}'): {
+            "container_name": runner.server_container_name,
+            "image": version
+        }
+        for i, (runner, server, version, _) in enumerate(runners)
+    }
+
     if sleep_after_servers > 0:
         logger.info(f"Sleeping for {sleep_after_servers} seconds before running the test...")
         time.sleep(sleep_after_servers)
@@ -505,7 +514,8 @@ def _run_test_client_and_collect(
     _finalize_and_upload_metadata(
         opensearch_logger, test_client_version, test_client_container_name, timestamp,
         test_client_exit_code, test_client_log_key, test_name, server_logs_dict,
-        None, test_start, test_finish, transfer_speed, missing_artefacts
+        None, test_start, test_finish, transfer_speed, missing_artefacts,
+        server_versions=server_versions
     )
 
 def _handle_artefacts(
@@ -547,7 +557,8 @@ def _finalize_and_upload_metadata(
     test_start: Optional[str],
     test_finish: Optional[str],
     transfer_speed: Optional[float],
-    missing_artefacts: Optional[list]
+    missing_artefacts: Optional[list],
+    server_versions: Optional[dict] = None
 ) -> None:
     """
     Exports test metadata and log references to OpenSearch.
@@ -565,7 +576,8 @@ def _finalize_and_upload_metadata(
             test_start=test_start,
             test_finish=test_finish,
             transfer_speed=transfer_speed,
-            missing_artefacts=missing_artefacts
+            missing_artefacts=missing_artefacts,
+            server_versions=server_versions
         )
 
 def run_test_client_only(

@@ -28,10 +28,11 @@ class OpenSearchLogger:
         test_start: Optional[str] = None,
         test_finish: Optional[str] = None,
         transfer_speed: Optional[float] = None,
-        missing_artefacts: Optional[list] = None,  # <-- Added parameter
+        missing_artefacts: Optional[list] = None,
+        server_versions: Optional[dict] = None,  # <-- Accept server_versions
     ) -> None:
         """
-        Exports metadata about a test run, including start and finish times, transfer speed, and missing artefacts.
+        Exports metadata about a test run, including start and finish times, transfer speed, missing artefacts, and server container info.
 
         Args:
             version (str): The container image version.
@@ -46,6 +47,7 @@ class OpenSearchLogger:
             test_finish (str, optional): The finish time of the test.
             transfer_speed (float, optional): The transfer speed in MB/s.
             missing_artefacts (list, optional): List of missing artefact paths.
+            server_versions (dict, optional): Server container name and image info.
         """
         metadata: Dict[str, Any] = {
             "version": version,
@@ -67,7 +69,9 @@ class OpenSearchLogger:
         if transfer_speed is not None:
             metadata["transfer_speed_MBps"] = transfer_speed
         if missing_artefacts is not None:
-            metadata["missing_artefacts"] = missing_artefacts  # <-- Add to metadata
+            metadata["missing_artefacts"] = missing_artefacts
+        if server_versions is not None:
+            metadata["server_versions"] = server_versions  # <-- Add to metadata
         logger.debug(f"Exporting metadata: {metadata}")
         self.upload_fn(metadata)
 

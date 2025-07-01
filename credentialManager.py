@@ -11,7 +11,7 @@ class CredentialManager:
     Handles checking and distributing authentication credentials required for XRootD tests.
     """
 
-    def __init__(self, x509_path: str = "/tmp/x509_u1000", bearer_env: str = "BEARER_TOKEN"):
+    def __init__(self, x509_path: str = "/tmp/x509up_u1000", bearer_env: str = "BEARER_TOKEN"):
         self.x509_path = x509_path
         self.bearer_env = bearer_env
         self.bearer_token = None
@@ -41,9 +41,9 @@ class CredentialManager:
         logger.info("All required credentials are present and valid.")
         return True
 
-    def distribute_x509_to_nodes(self, remote_hosts: List[str], remote_path: str = "/tmp/x509_u1000", user: str = "root") -> None:
+    def distribute_x509_to_nodes(self, remote_hosts: List[str], remote_path: str = "/tmp/x509up_u1000", user: str = "root") -> None:
         """
-        Copies the x509 file to the specified remote hosts using scp.
+        Copies the x509 file to the specified remote hosts using scp. Removes the old cert before uploading the new one, and ensures the file is owned by uid:gid 1000:1000.
 
         Args:
             remote_hosts (List[str]): List of hostnames or IPs to copy the file to.
@@ -53,10 +53,21 @@ class CredentialManager:
         for host in remote_hosts:
             dest = f"{user}@{host}:{remote_path}"
             try:
+                # Remove old cert on remote host before copying new one
+                logger.info(f"Removing old x509 cert at {remote_path} on {host}")
+                subprocess.run([
+                    "ssh", f"{user}@{host}", f"rm -f {remote_path}"
+                ], check=True)
                 logger.info(f"Copying {self.x509_path} to {dest}")
                 subprocess.run(["scp", self.x509_path, dest], check=True)
+                # Ensure file ownership is 1000:1000
+                logger.info(f"Setting ownership of {remote_path} to 1000:1000 on {host}")
+                subprocess.run([
+                    "ssh", f"{user}@{host}", f"chown 1000:1000 {remote_path}"
+                ], check=True)
             except subprocess.CalledProcessError as e:
                 logger.error(f"Failed to copy x509 file to {host}: {e}")
+                raise RuntimeError(f"Failed to copy x509 file to {host}: {e}")
 
     def inject_bearer_token(self, env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """
@@ -73,7 +84,7 @@ class CredentialManager:
         env[self.bearer_env] = self.bearer_token
         return env
 
-def check_x509_proxy_validity(x509_path: str = "/tmp/x509_u1000", min_seconds: int = 3600) -> bool:
+def check_x509_proxy_validity(x509_path: str = "/tmp/x509up_u1000", min_seconds: int = 3600) -> bool:
     """
     Checks if the x509 proxy at the given path is valid using voms-proxy-info,
     and ensures it has at least min_seconds of validity left.
