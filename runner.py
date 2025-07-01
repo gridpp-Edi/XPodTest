@@ -17,7 +17,7 @@ class XRootDTestRunner:
     Provides methods to launch servers, run test clients, collect logs, and clean up containers and artefacts.
     """
 
-    def __init__(self, podman_sock: str):
+    def __init__(self, podman_sock: str, connect_timeout: int = 30):
         """
         Initialize the test runner with a Podman socket URI.
 
@@ -25,6 +25,7 @@ class XRootDTestRunner:
             podman_sock (str): The Podman socket URI.
         """
         self.podman_sock: str = podman_sock
+        self.connect_timeout = connect_timeout
         self.test_volumes: Dict[str, Any] = {}
 
     def _get_client(self) -> PodmanClient:
@@ -35,7 +36,7 @@ class XRootDTestRunner:
             PodmanClient: A Podman client instance.
         """
         logger.debug(f"Connecting to Podman socket: {self.podman_sock}")
-        return PodmanClient(base_url=self.podman_sock)
+        return PodmanClient(base_url=self.podman_sock, connect_timeout=self.connect_timeout)
 
     def _generate_name(self, base: str, version: str, host: str) -> str:
         """
@@ -310,3 +311,60 @@ class XRootDTestRunner:
             logger.error(f"Failed to clean up artefacts: {e}")
         else:
             logger.debug("Artefact cleanup container ran successfully.")
+
+    @staticmethod
+    def check_artefacts_with_container(
+        test_volumes: dict,
+        artefact_paths: list,
+        check_image: str,
+        podman_sock: str,
+    ) -> list:
+        """
+        Checks for the existence of artefact files inside a container on the correct Podman URI.
+
+        Returns a list of missing artefacts.
+        """
+        from podman import PodmanClient
+
+        missing = []
+        checks = [f'[ -e "{path}" ] || echo MISSING:{path}' for path in artefact_paths]
+        check_cmd = " && ".join(checks)
+        command = ["/bin/sh", "-c", check_cmd]
+
+        with PodmanClient(base_url=podman_sock) as client:
+            container = client.containers.create(
+                image=check_image,
+                command=command,
+                volumes=test_volumes,
+                remove=True,
+                tty=True,
+            )
+            container.start()
+            exit_code = container.wait()
+            logs = b"".join(container.logs(stdout=True, stderr=True)).decode()
+            for line in logs.splitlines():
+                if line.startswith("MISSING:"):
+                    missing.append(line[len("MISSING:"):])
+            container.remove(force=True)
+        return missing
+
+    @staticmethod
+    def check_artefacts_in_container(container, artefact_paths: list) -> list:
+        """
+        Checks for the existence of artefact files inside the given running container.
+
+        Returns a list of missing artefacts.
+        """
+        missing = []
+        checks = [f'[ -e "{path}" ] || echo MISSING:{path}' for path in artefact_paths]
+        check_cmd = " && ".join(checks)
+        exec_result = container.exec_run(
+            cmd=["/bin/sh", "-c", check_cmd],
+            stdout=True,
+            stderr=True,
+        )
+        output = exec_result.output.decode() if hasattr(exec_result, "output") else exec_result[1].decode()
+        for line in output.splitlines():
+            if line.startswith("MISSING:"):
+                missing.append(line[len("MISSING:"):])
+        return missing

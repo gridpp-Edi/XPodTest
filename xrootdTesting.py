@@ -1,17 +1,30 @@
 #!/bin/env python3
 """
+XRootD Automated Test Runner
+
 This script manages the lifecycle of XRootD server and test containers using Podman.
-It launches the XRootD server, runs test client containers, collects logs,
-and uploads results to S3 or a compatible storage backend.
-It also exports test metadata to OpenSearch or a compatible backend.
-It is designed to be run in a GridPP environment with Podman and XRootD.
-It supports running multiple tests defined in JSON files located in a specified directory.
-It uses the Podman Python client to interact with containers and manage their lifecycle.
-It includes functionality for:
-- Launching an XRootD server container.
-- Running test client containers against the server.
-- Collecting logs from test containers.
-- Uploading logs to S3 or a compatible storage backend.
+It is designed for automated testing of XRootD deployments in environments such as GridPP.
+
+Features:
+- Launches XRootD server containers with configurable volumes and entrypoints.
+- Runs test client containers against the servers, supporting parallel and repeated execution.
+- Collects and uploads logs from both server and client containers to S3 or compatible storage.
+- Checks for the existence of expected artefacts inside the test environment (including tmpfs).
+- Cleans up artefacts and containers after test execution.
+- Exports detailed test metadata (including artefact status and transfer speed) to OpenSearch.
+- Supports configuration via JSON files and command-line arguments.
+- Integrates with Podman via the Python API, supporting both local and remote (SSH) Podman sockets.
+
+Typical usage:
+    python3 xrootdTesting.py --test_config tests/
+    python3 xrootdTesting.py --test_config tests/mytest.json --repeat 5 --debug
+
+Requirements:
+- Podman and the Podman Python client
+- S3-compatible storage and OpenSearch for log and metadata upload
+- Properly configured config.json for credentials and endpoints
+
+See README.md for more details and example test configuration files.
 """
 
 import argparse
@@ -21,11 +34,15 @@ import json
 import logging
 import os
 import re
+import requests
+import subprocess
+import sys
 import time
 import uuid
 from functools import partial
 from typing import Any, Dict, List, Optional
 
+from credentialManager import CredentialManager
 from osupload import OpenSearchLogger, real_opensearch_upload
 from runner import XRootDTestRunner
 from s3upload import S3Uploader, real_s3_upload
@@ -55,15 +72,28 @@ def load_config(config_path: str) -> dict:
 def load_private_config(config_path: str = "config.json") -> dict:
     """
     Loads private configuration (S3, OpenSearch) from a JSON file.
+    Tries "config.json" first, then "secrets/config.json" if not found.
 
     Args:
         config_path (str): Path to the configuration JSON file.
 
     Returns:
         dict: Parsed configuration.
+
+    Raises:
+        FileNotFoundError: If neither config.json nor secrets/config.json is found.
     """
-    with open(config_path) as f:
-        return json.load(f)
+    try:
+        with open(config_path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        alt_path = os.path.join("secrets", config_path)
+        try:
+            with open(alt_path) as f:
+                return json.load(f)
+        except FileNotFoundError:
+            logger.error(f"Could not find private config at '{config_path}' or '{alt_path}'")
+            raise
 
 def substitute_path(value: Any, test_path: str) -> Any:
     """
@@ -168,7 +198,7 @@ def cleanup_servers(
         except Exception as e:
             logger.warning(f"Failed to collect/remove server logs: {e}")
 
-def extract_transfer_speed(logs: str) -> float:
+def extract_transfer_speed(logs: str) -> Optional[float]:
     """
     Extracts the final transfer speed in MB/s from xrdcp or curl logs.
     Supports kB/s, MB/s, and GB/s units, and curl's progress output.
@@ -207,6 +237,34 @@ def extract_transfer_speed(logs: str) -> float:
 
     return None
 
+MAX_RETRIES = 3
+
+def run_test_client_with_retries(run_func, *args, **kwargs) -> Any:
+    """
+    Runs the given test client function with automatic retries on failure.
+
+    Args:
+        run_func: The function to run (e.g., run_test_client_only).
+        *args: Positional arguments for the function.
+        **kwargs: Keyword arguments for the function.
+
+    Returns:
+        The result of the function if successful.
+
+    Raises:
+        Exception: The last exception encountered if all retries fail.
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return run_func(*args, **kwargs)
+        except (subprocess.TimeoutExpired, requests.exceptions.RequestException, OSError) as e:
+            logger.warning(f"Test client attempt {attempt} failed with error: {e}")
+            if attempt == MAX_RETRIES:
+                logger.error("Max retries reached. Giving up.")
+                raise
+            logger.info(f"Retrying test client (attempt {attempt + 1}/{MAX_RETRIES}) after failure...")
+            time.sleep(5)
+
 def run_single_test(
     test_file: str,
     default_version: str,
@@ -220,183 +278,295 @@ def run_single_test(
     container_suffix: str = ""
 ) -> None:
     """
-    Runs a single test as described in the given test configuration file, possibly multiple times or in parallel.
-    Records start and finish times and includes them in OpenSearch metadata.
+    Orchestrates the full lifecycle of a single test, including server/client startup,
+    parallelization, artefact handling, and metadata export.
+    """
+    test_json, test_config, test_path, parallel_repeats = _prepare_test_context(test_file, default_version)
+    if parallel_repeats and parallel_repeats > 1 and not container_suffix:
+        _run_parallel_clients(
+            test_json, test_config, test_path, parallel_repeats, default_version, s3_uploader,
+            opensearch_logger, server_version, test_version, sleep_after_servers, extra_env
+        )
+        return
+
+    _run_sequential_clients(
+        test_file, test_json, test_config, test_path, repeat, default_version, s3_uploader,
+        opensearch_logger, server_version, test_version, sleep_after_servers, extra_env, container_suffix
+    )
+
+def _prepare_test_context(test_file: str, default_version: str) -> tuple[dict, dict, str, int]:
+    """
+    Loads and prepares the test context from the test file.
     """
     with open(test_file) as f:
         test_json: dict = json.load(f)
-
     test_config: dict = test_json.get("test_config", test_json)
     test_path: str = test_json.get("TEST_PATH", "/tmp")
     parallel_repeats = test_config.get("parallel_repeats", 0)
+    return test_json, test_config, test_path, parallel_repeats
 
-    # Only do parallel on outermost call
-    if parallel_repeats and parallel_repeats > 1 and not container_suffix:
-        servers: List[dict] = test_json.get("servers", [])
-        if not servers:
-            logger.warning(f"No servers defined in {test_file}, skipping.")
-            return
+def _run_parallel_clients(
+    test_json: dict,
+    test_config: dict,
+    test_path: str,
+    parallel_repeats: int,
+    default_version: str,
+    s3_uploader: Optional[S3Uploader],
+    opensearch_logger: Optional[OpenSearchLogger],
+    server_version: Optional[str],
+    test_version: Optional[str],
+    sleep_after_servers: int,
+    extra_env: Optional[Dict[str, str]]
+) -> None:
+    """
+    Handles launching servers and running test clients in parallel.
+    """
+    servers: List[dict] = test_json.get("servers", [])
+    if not servers:
+        logger.warning("No servers defined, skipping.")
+        return
 
-        test_default_version: str = default_version or test_json.get("default_version", "gridppedi/xrdtesting:xrd-v5.8.3")
-        # Start servers ONCE
-        logger.info(f"Launching servers for parallel test execution ({parallel_repeats} clients)...")
-        runners = launch_servers(servers, test_default_version, test_path, server_version=server_version)
-        if not runners:
-            logger.warning("No runners launched, skipping test.")
-            return
+    test_default_version: str = default_version or test_json.get("default_version", "gridppedi/xrdtesting:xrd-v5.8.3")
+    logger.info(f"Launching servers for parallel test execution ({parallel_repeats} clients)...")
+    runners = launch_servers(servers, test_default_version, test_path, server_version=server_version)
+    if not runners:
+        logger.warning("No runners launched, skipping test.")
+        return
 
-        # Attach runner info to each server dict for use in client-only runs
-        for idx, (runner, server, version, test_path) in enumerate(runners):
-            servers[idx]["runner_tuple"] = (runner, server, version, test_path)
+    for idx, (runner, server, version, test_path) in enumerate(runners):
+        servers[idx]["runner_tuple"] = (runner, server, version, test_path)
 
-        if sleep_after_servers > 0:
-            logger.info(f"Sleeping for {sleep_after_servers} seconds before running parallel test clients...")
-            time.sleep(sleep_after_servers)
+    if sleep_after_servers > 0:
+        logger.info(f"Sleeping for {sleep_after_servers} seconds before running parallel test clients...")
+        time.sleep(sleep_after_servers)
 
-        logger.info(f"Starting {parallel_repeats} parallel test client runs for {test_file}...")
-        def run_client_instance(suffix):
-            logger.debug(f"Starting parallel test client with suffix {suffix}")
-            return run_test_client_only(
-                test_json,
-                test_config,
-                test_path,
-                default_version,
-                s3_uploader,
-                opensearch_logger,
-                server_version,
-                test_version,
-                0,  # Don't sleep again
-                extra_env,
-                suffix
-            )
+    logger.info(f"Starting {parallel_repeats} parallel test client runs...")
+    def run_client_instance(suffix):
+        logger.debug(f"Starting parallel test client with suffix {suffix}")
+        return run_test_client_with_retries(
+            run_test_client_only,
+            test_json,
+            test_config,
+            test_path,
+            default_version,
+            s3_uploader,
+            opensearch_logger,
+            server_version,
+            test_version,
+            0,
+            extra_env,
+            suffix
+        )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_repeats) as executor:
-            futures = [
-                executor.submit(run_client_instance, f"-parallel-{i}-{uuid.uuid4().hex[:8]}")
-                for i in range(parallel_repeats)
-            ]
-            logger.info(f"Submitted all {parallel_repeats} parallel test client jobs.")
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    result = future.result()
-                    logger.debug("A parallel test client finished successfully.")
-                except Exception as e:
-                    logger.error(f"Parallel test run failed: {e}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_repeats) as executor:
+        futures = [
+            executor.submit(run_client_instance, f"-parallel-{i}-{uuid.uuid4().hex[:8]}")
+            for i in range(parallel_repeats)
+        ]
+        logger.info(f"Submitted all {parallel_repeats} parallel test client jobs.")
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                result = future.result()
+                logger.debug("A parallel test client finished successfully.")
+            except Exception as e:
+                logger.error(f"Parallel test run failed: {e}")
 
-        logger.info("All parallel test clients have completed. Cleaning up servers...")
-        # Clean up servers after all clients are done
-        timestamp = datetime.datetime.utcnow().isoformat()
-        server_logs_dict: Dict[str, str] = {}
-        cleanup_servers(runners, timestamp, s3_uploader, server_logs_dict)
-        logger.info("Server cleanup after parallel execution complete.")
-        return  # Do not continue with the sequential logic
+    logger.info("All parallel test clients have completed. Cleaning up servers...")
+    timestamp = datetime.datetime.utcnow().isoformat()
+    server_logs_dict: Dict[str, str] = {}
+    cleanup_servers(runners, timestamp, s3_uploader, server_logs_dict)
+    logger.info("Server cleanup after parallel execution complete.")
 
+def _run_sequential_clients(
+    test_file: str,
+    test_json: dict,
+    test_config: dict,
+    test_path: str,
+    repeat: int,
+    default_version: str,
+    s3_uploader: Optional[S3Uploader],
+    opensearch_logger: Optional[OpenSearchLogger],
+    server_version: Optional[str],
+    test_version: Optional[str],
+    sleep_after_servers: int,
+    extra_env: Optional[Dict[str, str]],
+    container_suffix: str
+) -> None:
+    """
+    Handles sequential test client execution and server lifecycle.
+    """
     for i in range(repeat):
         logger.info(f"Running test iteration {i+1}/{repeat} for: {test_file}")
-        logger.info(f"Processing test file: {test_file}")
-        with open(test_file) as f:
-            test_json: dict = json.load(f)
+        _run_test_client_and_collect(
+            test_file, test_json, test_config, test_path, default_version, s3_uploader,
+            opensearch_logger, server_version, test_version, sleep_after_servers, extra_env, container_suffix
+        )
 
-        servers: List[dict] = test_json.get("servers", [])
-        if not servers:
-            logger.warning(f"No servers defined in {test_file}, skipping.")
-            return
+def _run_test_client_and_collect(
+    test_file: str,
+    test_json: dict,
+    test_config: dict,
+    test_path: str,
+    default_version: str,
+    s3_uploader: Optional[S3Uploader],
+    opensearch_logger: Optional[OpenSearchLogger],
+    server_version: Optional[str],
+    test_version: Optional[str],
+    sleep_after_servers: int,
+    extra_env: Optional[Dict[str, str]],
+    container_suffix: str
+) -> None:
+    """
+    Launches servers, runs the test client, collects logs, and handles artefacts.
+    Retries server initialization on connection/timeout errors.
+    """
+    servers: List[dict] = test_json.get("servers", [])
+    if not servers:
+        logger.warning(f"No servers defined in {test_file}, skipping.")
+        return
 
-        # Use the passed default_version (from CLI if provided) instead of the config's default_version
-        test_default_version: str = default_version or test_json.get("default_version", "gridppedi/xrdtesting:xrd-v5.8.3")
-        test_config: dict = test_json.get("test_config", test_json)
-        test_path: str = test_json.get("TEST_PATH", "/tmp")
+    test_default_version: str = default_version or test_json.get("default_version", "gridppedi/xrdtesting:xrd-v5.8.3")
+    test_config: dict = test_json.get("test_config", test_json)
+    test_path: str = test_json.get("TEST_PATH", "/tmp")
+    test_start = datetime.datetime.utcnow().isoformat()
 
-        # Record test start time
-        test_start = datetime.datetime.utcnow().isoformat()
+    MAX_SERVER_RETRIES = 3
+    for attempt in range(1, MAX_SERVER_RETRIES + 1):
+        try:
+            runners = launch_servers(servers, test_default_version, test_path, server_version=server_version)
+            break
+        except (subprocess.TimeoutExpired, requests.exceptions.RequestException, OSError) as e:
+            logger.warning(f"Server launch attempt {attempt} failed with error: {e}")
+            if attempt == MAX_SERVER_RETRIES:
+                logger.error("Max server launch retries reached. Giving up.")
+                return
+            logger.info(f"Retrying server launch (attempt {attempt + 1}/{MAX_SERVER_RETRIES}) after failure...")
+            time.sleep(5)
+    else:
+        logger.error("Failed to launch servers after retries.")
+        return
 
-        runners = launch_servers(servers, test_default_version, test_path, server_version=server_version)
-        if not runners:
-            logger.warning("No runners launched, skipping test.")
-            return
+    if sleep_after_servers > 0:
+        logger.info(f"Sleeping for {sleep_after_servers} seconds before running the test...")
+        time.sleep(sleep_after_servers)
 
-        # Optional sleep after starting servers
-        if sleep_after_servers > 0:
-            logger.info(f"Sleeping for {sleep_after_servers} seconds before running the test...")
-            time.sleep(sleep_after_servers)
+    test_command = substitute_path(test_config["test_command"], test_path)
+    test_volumes = substitute_path(test_config["test_volumes"], test_path)
+    artefact_paths = substitute_path(test_config.get("artefact_paths", []), test_path)
+    test_env = test_config.get("test_env", {})
+    if extra_env:
+        test_env.update(extra_env)
 
-        test_command = substitute_path(test_config["test_command"], test_path)
-        test_volumes = substitute_path(test_config["test_volumes"], test_path)
-        artefact_paths = substitute_path(test_config.get("artefact_paths", []), test_path)
-        test_env = test_config.get("test_env", {})
+    runner, server, _, _ = runners[0]
+    test_client_uri = test_config.get("uri", server.get("uri"))
+    if not test_client_uri:
+        logger.warning("No Podman URI specified for test client; using server's URI.")
+        test_client_uri = server.get("uri")
 
-        # Handle extra environment variables from CLI
-        test_env = test_config.get("test_env", {})
-        if extra_env:
-            test_env.update(extra_env)
+    test_runner = XRootDTestRunner(podman_sock=test_client_uri, connect_timeout=30)
+    test_client_version = test_version or test_config.get("version", test_default_version)
 
-        runner, server, _, _ = runners[0]
-
-        # Determine the Podman URI for the test client container
-        test_client_uri = test_config.get("uri", server.get("uri"))
-        if not test_client_uri:
-            logger.warning("No Podman URI specified for test client; using server's URI.")
-            test_client_uri = server.get("uri")
-
-        # Use the specified Podman URI to run the test client container
-        test_runner = XRootDTestRunner(podman_sock=test_client_uri)
-        test_client_version = test_version or test_config.get("version", test_default_version)
-
-        logger.info(f"Running test client for {server.get('server', 'localhost')} with image {test_client_version} on podman URI {test_client_uri}")
-        exit_code, logs = test_runner.run_test(
+    logger.info(f"Running test client for {server.get('server', 'localhost')} with image {test_client_version} on podman URI {test_client_uri}")
+    # (after server setup and before artefact handling)
+    def run_client():
+        return test_runner.run_test(
             test_client_version, test_command, test_volumes, test_env, container_suffix=container_suffix
         )
 
-        logger.debug("\n========== Test Logs ==========")
-        logger.debug(logs)
-        logger.debug("======== End Test Logs ========\n")
+    exit_code, logs = run_test_client_with_retries(run_client)
 
-        # Extract transfer speed from logs
-        transfer_speed = extract_transfer_speed(logs)
-        logger.info(f"Extracted transfer speed: {transfer_speed} MB/s" if transfer_speed is not None else "No transfer speed found in logs.")
+    logger.debug("\n========== Test Logs ==========")
+    logger.debug(logs)
+    logger.debug("======== End Test Logs ========\n")
 
-        # Record test finish time
-        test_finish = datetime.datetime.utcnow().isoformat()
+    transfer_speed = extract_transfer_speed(logs)
+    logger.info(f"Extracted transfer speed: {transfer_speed} MB/s" if transfer_speed is not None else "No transfer speed found in logs.")
 
-        timestamp: str = test_finish  # Use finish time for log key
-        test_client_log_key = f"logs/{test_runner.test_container_name}-{timestamp}.log"
-        if s3_uploader:
-            s3_uploader.upload_logs(test_client_log_key, logs.encode())
+    test_finish = datetime.datetime.utcnow().isoformat()
+    timestamp: str = test_finish
+    test_client_log_key = f"logs/{test_runner.test_container_name}-{timestamp}.log"
+    if s3_uploader:
+        s3_uploader.upload_logs(test_client_log_key, logs.encode())
 
-        test_client_exit_code = exit_code
-        test_client_container_name = test_runner.test_container_name
+    test_client_exit_code = exit_code
+    test_client_container_name = test_runner.test_container_name
 
-        # Compose test name with folder name
-        folder_name = os.path.basename(os.path.dirname(test_file))
-        original_test_name = test_json.get("name", os.path.basename(test_file))
-        test_name = f"{folder_name}/{original_test_name}"
+    folder_name = os.path.basename(os.path.dirname(test_file))
+    original_test_name = test_json.get("name", os.path.basename(test_file))
+    test_name = f"{folder_name}/{original_test_name}"
 
-        # Clean up artefact files if specified
-        if artefact_paths:
-            # Remove artefact files from host-mounted volumes using a cleanup container
-            XRootDTestRunner.cleanup_artefacts_with_container(
-                test_volumes, artefact_paths, cleanup_image="busybox", podman_sock=runner.podman_sock
-            )
+    missing_artefacts = _handle_artefacts(
+        artefact_paths, test_volumes, runner, logger
+    )
 
-        # Collect and upload server logs, then remove containers
-        server_logs_dict: Dict[str, str] = {}
-        cleanup_servers(runners, timestamp, s3_uploader, server_logs_dict)
+    server_logs_dict: Dict[str, str] = {}
+    cleanup_servers(runners, timestamp, s3_uploader, server_logs_dict)
 
-        # Export test metadata and log references to OpenSearch, including start/finish
-        if opensearch_logger:
-            opensearch_logger.export_metadata(
-                version=test_client_version,
-                container_name=test_client_container_name,
-                timestamp=timestamp,
-                exit_code=test_client_exit_code,
-                log_key=test_client_log_key,
-                test_name=test_name,
-                server_logs=server_logs_dict,
-                test_client_log=None,
-                test_start=test_start,
-                test_finish=test_finish,
-                transfer_speed=transfer_speed
-            )
+    _finalize_and_upload_metadata(
+        opensearch_logger, test_client_version, test_client_container_name, timestamp,
+        test_client_exit_code, test_client_log_key, test_name, server_logs_dict,
+        None, test_start, test_finish, transfer_speed, missing_artefacts
+    )
+
+def _handle_artefacts(
+    artefact_paths: list,
+    test_volumes: dict,
+    runner: Any,
+    logger: logging.Logger
+) -> list:
+    """
+    Checks for and cleans up artefacts inside the test environment.
+    Returns a list of missing artefacts.
+    """
+    missing_artefacts = []
+    if artefact_paths:
+        logger.info("Checking for expected artefacts inside the test environment...")
+        missing_artefacts = XRootDTestRunner.check_artefacts_with_container(
+            test_volumes, artefact_paths, check_image="busybox", podman_sock=runner.podman_sock
+        )
+        if missing_artefacts:
+            logger.error(f"Missing artefacts: {missing_artefacts}")
+        else:
+            logger.info("All expected artefacts were created.")
+
+        XRootDTestRunner.cleanup_artefacts_with_container(
+            test_volumes, artefact_paths, cleanup_image="busybox", podman_sock=runner.podman_sock
+        )
+    return missing_artefacts
+
+def _finalize_and_upload_metadata(
+    opensearch_logger: Optional[OpenSearchLogger],
+    test_client_version: str,
+    test_client_container_name: str,
+    timestamp: str,
+    test_client_exit_code: int,
+    test_client_log_key: str,
+    test_name: str,
+    server_logs_dict: Dict[str, str],
+    test_client_log: Optional[str],
+    test_start: Optional[str],
+    test_finish: Optional[str],
+    transfer_speed: Optional[float],
+    missing_artefacts: Optional[list]
+) -> None:
+    """
+    Exports test metadata and log references to OpenSearch.
+    """
+    if opensearch_logger:
+        opensearch_logger.export_metadata(
+            version=test_client_version,
+            container_name=test_client_container_name,
+            timestamp=timestamp,
+            exit_code=test_client_exit_code,
+            log_key=test_client_log_key,
+            test_name=test_name,
+            server_logs=server_logs_dict,
+            test_client_log=test_client_log,
+            test_start=test_start,
+            test_finish=test_finish,
+            transfer_speed=transfer_speed,
+            missing_artefacts=missing_artefacts
+        )
 
 def run_test_client_only(
     test_json: dict,
@@ -411,6 +581,25 @@ def run_test_client_only(
     extra_env: Optional[Dict[str, str]],
     container_suffix: str
 ) -> None:
+    """
+    Runs only the test client logic for a given test configuration.
+
+    This is used for parallel execution, where servers are started once and
+    multiple test clients are run in parallel containers.
+
+    Args:
+        test_json (dict): The loaded test configuration JSON.
+        test_config (dict): The test_config section from the JSON.
+        test_path (str): Path for TEST_PATH substitution.
+        default_version (str): Default container image version.
+        s3_uploader (Optional[S3Uploader]): S3 uploader instance for log upload.
+        opensearch_logger (Optional[OpenSearchLogger]): OpenSearch logger instance.
+        server_version (Optional[str]): Override for the server container version.
+        test_version (Optional[str]): Override for the test client container version.
+        sleep_after_servers (int): Seconds to sleep after starting servers.
+        extra_env (Optional[Dict[str, str]]): Extra environment variables for the test client.
+        container_suffix (str): Suffix for container names (used in parallel runs).
+    """
     servers: List[dict] = test_json.get("servers", [])
     if not servers or "runner_tuple" not in servers[0]:
         logger.error("No server runner info found for parallel test client run.")
@@ -431,7 +620,7 @@ def run_test_client_only(
         logger.warning("No Podman URI specified for test client; using server's URI.")
         test_client_uri = server.get("uri")
 
-    test_runner = XRootDTestRunner(podman_sock=test_client_uri)
+    test_runner = XRootDTestRunner(podman_sock=test_client_uri, connect_timeout=5)
     test_client_version = test_version or test_config.get("version", test_default_version)
 
     logger.info(f"Running test client for {server.get('server', 'localhost')} with image {test_client_version} on podman URI {test_client_uri}")
@@ -459,7 +648,18 @@ def run_test_client_only(
     original_test_name = test_json.get("name", os.path.basename(test_json.get('name', '')))
     test_name = f"{folder_name}/{original_test_name}"
 
+
+    # Check artefacts before removing the container
     if artefact_paths:
+        logger.info("Checking for expected artefacts inside the test client container...")
+        missing_artefacts = XRootDTestRunner.check_artefacts_with_container(
+            test_volumes, artefact_paths, check_image="busybox", podman_sock=runner.podman_sock
+        )
+        if missing_artefacts:
+            logger.error(f"Missing artefacts: {missing_artefacts}")
+        else:
+            logger.info("All expected artefacts were created inside the test client container.")
+
         XRootDTestRunner.cleanup_artefacts_with_container(
             test_volumes, artefact_paths, cleanup_image="busybox", podman_sock=runner.podman_sock
         )
@@ -478,7 +678,8 @@ def run_test_client_only(
             test_client_log=None,
             test_start=None,
             test_finish=test_finish,
-            transfer_speed=transfer_speed
+            transfer_speed=transfer_speed,
+            missing_artefacts=missing_artefacts if artefact_paths else None
         )
 
 def run_tests_from_folder(
@@ -577,6 +778,18 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
+def extract_remote_hosts_from_json(test_json: dict) -> List[str]:
+    """
+    Extracts the list of remote server hostnames from the test JSON.
+    """
+    servers = test_json.get("servers", [])
+    hosts = []
+    for server in servers:
+        hostname = server.get("server")
+        if hostname:
+            hosts.append(hostname)
+    return hosts
+
 def main() -> None:
     """
     Entry point for running all tests.
@@ -596,10 +809,10 @@ def main() -> None:
 
     extra_env = dict(item.split("=", 1) for item in args.test_env)
 
-    # Load private config
+    # Load private config (S3/OpenSearch secrets)
     private_config = load_private_config()
 
-    # S3 config
+    # S3 and OpenSearch setup (as before)
     s3_cfg = private_config["s3"]
     s3_uploader = S3Uploader(
         partial(
@@ -627,42 +840,54 @@ def main() -> None:
         )
     )
 
-    # Use the CLI-provided container version if given, else None
-    cli_default_version = args.container_version
+    cli_default_version = args.container_version or private_config.get("default_version", "gridppedi/xrdtesting:xrd-v5.8.3")
     cli_server_version = args.server_version
     cli_test_version = args.test_version
     repeat = args.repeat
     sleep_after_servers = args.sleep_after_servers
 
-    if args.test_config:
-        if os.path.isdir(args.test_config):
-            logger.info(f"Running all tests in directory: {args.test_config}")
-            run_tests_from_folder(
-                test_dir=args.test_config,
-                s3_uploader=s3_uploader,
-                opensearch_logger=opensearch_logger,
-                default_version=cli_default_version,
-                server_version=cli_server_version,
-                test_version=cli_test_version,
-                repeat=repeat,
-                sleep_after_servers=sleep_after_servers,
-                extra_env=extra_env
-            )
-        else:
-            logger.info(f"Running single test from config: {args.test_config}")
-            run_single_test(
-                args.test_config,
-                cli_default_version,
-                s3_uploader,
-                opensearch_logger,
-                server_version=cli_server_version,
-                test_version=cli_test_version,
-                repeat=repeat,
-                sleep_after_servers=sleep_after_servers,
-                extra_env=extra_env
-            )
+    logger.info(f"Using container version: {cli_default_version}")
+    logger.info(f"Using server version: {cli_server_version}")
+    logger.info(f"Using test client version: {cli_test_version}")
+
+    # --- CredentialManager integration ---
+    cred_mgr = CredentialManager()
+    if not cred_mgr.check_credentials():
+        logger.error("Missing authentication credentials. Aborting tests.")
+        sys.exit(1)
+
+    # For a single test file, extract hosts and distribute x509
+    if args.test_config and not os.path.isdir(args.test_config):
+        with open(args.test_config) as f:
+            test_json = json.load(f)
+        remote_hosts = extract_remote_hosts_from_json(test_json)
+        cred_mgr.distribute_x509_to_nodes(remote_hosts)
+        extra_env = cred_mgr.inject_bearer_token(extra_env)
+        run_single_test(
+            args.test_config,
+            cli_default_version,
+            s3_uploader,
+            opensearch_logger,
+            server_version=cli_server_version,
+            test_version=cli_test_version,
+            repeat=repeat,
+            sleep_after_servers=sleep_after_servers,
+            extra_env=extra_env
+        )
     else:
+        # For a folder, collect all hosts from all test files
+        all_hosts = set()
+        test_dir = args.test_config if args.test_config else "tests"
+        for root, _, files in os.walk(test_dir):
+            for test_file in files:
+                if test_file.endswith(".json"):
+                    with open(os.path.join(root, test_file)) as f:
+                        test_json = json.load(f)
+                    all_hosts.update(extract_remote_hosts_from_json(test_json))
+        cred_mgr.distribute_x509_to_nodes(list(all_hosts))
+        extra_env = cred_mgr.inject_bearer_token(extra_env)
         run_tests_from_folder(
+            test_dir,
             s3_uploader=s3_uploader,
             opensearch_logger=opensearch_logger,
             default_version=cli_default_version,
@@ -672,6 +897,7 @@ def main() -> None:
             sleep_after_servers=sleep_after_servers,
             extra_env=extra_env
         )
+
     logger.info("All tests complete.")
 
 if __name__ == "__main__":

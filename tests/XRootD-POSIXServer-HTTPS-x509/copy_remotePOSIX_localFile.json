@@ -1,15 +1,15 @@
 {
   "default_version": "gridppedi/xrdtesting:xrd-v5.8.3",
   "TEST_PATH": "/nfs/XRootD-servers/XRootD-POSIXServer-HTTPS-x509",
-  "name": "curl_remotePOSIX_localFile",
-  "description": "Copy a file from a remote POSIX server to a local file system using curl.",
+  "name": "copy_remotePOSIX_localFile",
+  "description": "Copy a file from a remote POSIX server to a local file system using xrdcp.",
   "version": "1.0.0",
 
   "servers": [
     {
       "uri": "ssh://root@xrd1.edi.scotgrid.ac.uk:2222/run/podman/podman.sock",
       "server": "xrd1.edi.scotgrid.ac.uk",
-      "port": 8443,
+      "port": 1094,
 
       "server_config": {
         "entrypoint": ["/entrypoint.sh"],
@@ -38,13 +38,10 @@
   "test_config": {
     "uri": "ssh://root@xrd1.edi.scotgrid.ac.uk:2222/run/podman/podman.sock",
     "test_command": [
-      "curl",
-      "--cert", "/tmp/x509up_u1000",
-      "--key", "/tmp/x509up_u1000",
-      "--capath", "/etc/grid-security/certificates",
-      "https://xrd1.edi.scotgrid.ac.uk:8443/data/testFile",
-      "-o",
-      "/output/testFile"
+      "/usr/bin/xrdcp",
+      "-d1",
+      "root://xrd1.edi.scotgrid.ac.uk:1094//data/testFile",
+      "/output/"
     ],
     "test_volumes": {
       "/etc/hostname": { "bind": "/etc/hostname", "mode": "ro" },

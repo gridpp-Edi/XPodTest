@@ -25,14 +25,6 @@
           "TEST_PATH/entrypoint.sh": { "bind": "/entrypoint.sh", "mode": "ro" }
         }
       }
-    },
-    {
-      "uri": "ssh://root@xrd2.edi.scotgrid.ac.uk:2222/run/podman/podman.sock",
-      "server": "xrd2.edi.scotgrid.ac.uk"
-    },
-    {
-      "uri": "ssh://root@xrd3.edi.scotgrid.ac.uk:2222/run/podman/podman.sock",
-      "server": "xrd3.edi.scotgrid.ac.uk"
     }
   ],
 
